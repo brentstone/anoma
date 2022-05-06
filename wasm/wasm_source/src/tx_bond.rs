@@ -20,6 +20,8 @@ fn apply_tx(tx_data: Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use anoma::proto::Tx;
     use anoma_tests::log::test;
     use anoma_tests::tx::*;
@@ -118,29 +120,40 @@ mod tests {
             let pos_balance_post: token::Amount = read(&pos_balance_key.to_string()).unwrap();
             assert_eq!(pos_balance_pre + bond.amount, pos_balance_post);
 
-            // TODO: finish bond checks (there's a bizarre type checker error)
             //     - `#{PoS}/bond/#{owner}/#{validator}`
-            // let bond_src = bond.source.clone().unwrap_or_else(|| bond.validator.clone());
-            // let bond_id = BondId {validator: bond.validator.clone(), source: bond_src};
-            // let bonds_post = PoS.read_bond(&bond_id).unwrap();
-            // match &bond.source {
-            //     Some(_) => {
-            //         // This bond was a delegation
-            //         for epoch in 0..pos_params.pipeline_len {
-            //             // let expected_bond = HashMap::default();
-            //             let bond: Option<Bond<token::Amount>> = bonds_post.get(epoch);
-            //             let expected_bond: Option<Bond<token::Amount>> = None;
-            //             assert_eq!(bond, expected_bond);
-            //             // assert_eq!(bond, None, "Delegation before pipeline offset should be 0 - checking epoch {epoch}");
-            //         }
-            //         for epoch in pos_params.pipeline_len..=pos_params.unbonding_len {
-            //             // assert_eq!(bonds_post.get(epoch), Some(bond.amount.into()), "Delegation at and after pipeline offset should be equal to the bonded amount - checking epoch {epoch}");
-            //         }
-            //     },
-            //     None => {
-            //         // It was a self-bond
-            //     }
-            // }
+            let bond_src = bond.source.clone().unwrap_or_else(|| bond.validator.clone());
+            let bond_id = BondId {validator: bond.validator.clone(), source: bond_src};
+            let bonds_post = PoS.read_bond(&bond_id).unwrap();
+            match &bond.source {
+                Some(_) => {
+                    // This bond was a delegation
+                    for epoch in 0..pos_params.pipeline_len {
+                        let bond: Option<Bond<token::Amount>> = bonds_post.get(epoch);
+                        assert!(bond.is_none(), "Delegation before pipeline offset should be empty - checking epoch {epoch}");
+                    }
+                    for epoch in pos_params.pipeline_len..=pos_params.unbonding_len {
+                        let start_epoch = anoma_tx_prelude::proof_of_stake::types::Epoch::from(pos_params.pipeline_len);
+                        let expected_bond = HashMap::from_iter([(start_epoch, bond.amount)]);
+                        let bond: Bond<token::Amount> = bonds_post.get(epoch).unwrap();
+                        assert_eq!(bond.deltas, expected_bond, "Delegation at and after pipeline offset should be equal to the bonded amount - checking epoch {epoch}");
+                    }
+                },
+                None => {
+                    let genesis_epoch = anoma_tx_prelude::proof_of_stake::types::Epoch::from(0);
+                    // It was a self-bond
+                    for epoch in 0..pos_params.pipeline_len {
+                        let expected_bond = HashMap::from_iter([(genesis_epoch, initial_stake)]);
+                        let bond: Bond<token::Amount> = bonds_post.get(epoch).expect("Genesis validator should already have self-bond");
+                        assert_eq!(bond.deltas, expected_bond, "Delegation before pipeline offset should be equal to the genesis initial stake - checking epoch {epoch}");
+                    }
+                    for epoch in pos_params.pipeline_len..=pos_params.unbonding_len {
+                        let start_epoch = anoma_tx_prelude::proof_of_stake::types::Epoch::from(pos_params.pipeline_len);
+                        let expected_bond = HashMap::from_iter([(genesis_epoch, initial_stake), (start_epoch, bond.amount)]);
+                        let bond: Bond<token::Amount> = bonds_post.get(epoch).unwrap();
+                        assert_eq!(bond.deltas, expected_bond, "Delegation at and after pipeline offset should contain genesis stake and the bonded amount - checking epoch {epoch}");
+                    }
+                }
+            }
 
             // TODO:
 
