@@ -21,18 +21,22 @@ fn apply_tx(tx_data: Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use anoma::proto::Tx;
-    use anoma_tests::tx::*;
-    use anoma_tx_prelude::address::InternalAddress;
-    use anoma_tx_prelude::address::testing::{arb_address, arb_established_address};
-    use anoma_tx_prelude::proof_of_stake::parameters::testing::arb_pos_params;
-    use anoma_tx_prelude::token::testing::arb_amount;
-    use anoma_tx_prelude::key::testing::arb_common_keypair;
-    use anoma_vp_prelude::proof_of_stake::types::Bond;
-    use anoma_vp_prelude::proof_of_stake::{GenesisValidator, staking_token_address, BondId};
-    use anoma_vp_prelude::proof_of_stake::anoma_proof_of_stake::PosBase;
-    use anoma_tx_prelude::key::RefTo;
-    use proptest::prelude::*;
     use anoma_tests::log::test;
+    use anoma_tests::tx::*;
+    use anoma_tx_prelude::address::testing::{
+        arb_established_address, arb_non_internal_address,
+    };
+    use anoma_tx_prelude::address::InternalAddress;
+    use anoma_tx_prelude::key::testing::arb_common_keypair;
+    use anoma_tx_prelude::key::RefTo;
+    use anoma_tx_prelude::proof_of_stake::parameters::testing::arb_pos_params;
+    use anoma_tx_prelude::token;
+    use anoma_vp_prelude::proof_of_stake::anoma_proof_of_stake::PosBase;
+    use anoma_vp_prelude::proof_of_stake::types::Bond;
+    use anoma_vp_prelude::proof_of_stake::{
+        staking_token_address, BondId, GenesisValidator,
+    };
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -41,10 +45,9 @@ mod tests {
         /// modifications.
         #[test]
         fn test_no_op_transaction(
-            bond in arb_bond(), 
-            key in arb_common_keypair(), 
-            pos_params in arb_pos_params(),
-            initial_stake in arb_amount()) {
+            (initial_stake, bond) in arb_initial_stake_and_bond(),
+            key in arb_common_keypair(),
+            pos_params in arb_pos_params()) {
             // The environment must be initialized first
             tx_host_env::init();
 
@@ -148,13 +151,36 @@ mod tests {
         }
     }
 
-    fn arb_bond() -> impl Strategy<Value = transaction::pos::Bond> {
-        (arb_established_address(), prop::option::of(arb_address()), arb_amount()).prop_map(
-            |(validator, source, amount)| transaction::pos::Bond {
-                validator: Address::Established(validator),
-                amount,
-                source,
-            },
+    prop_compose! {
+        /// Generates an initial validator stake and a bond, while making sure
+        /// that the `initial_stake + bond.amount <= u64::MAX` to avoid
+        /// overflow.
+        fn arb_initial_stake_and_bond()
+            // Generate initial stake
+            (initial_stake in token::testing::arb_amount())
+            // Use the initial stake to limit the bond amount
+            (bond in arb_bond(u64::MAX - u64::from(initial_stake)),
+            // Use the generated initial stake too too
+            initial_stake in Just(initial_stake),
+        ) -> (token::Amount, transaction::pos::Bond) {
+            (initial_stake, bond)
+        }
+    }
+
+    fn arb_bond(
+        max_amount: u64,
+    ) -> impl Strategy<Value = transaction::pos::Bond> {
+        (
+            arb_established_address(),
+            prop::option::of(arb_non_internal_address()),
+            token::testing::arb_amount_ceiled(max_amount.into()),
         )
+            .prop_map(|(validator, source, amount)| {
+                transaction::pos::Bond {
+                    validator: Address::Established(validator),
+                    amount,
+                    source,
+                }
+            })
     }
 }
