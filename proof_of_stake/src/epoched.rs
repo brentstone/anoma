@@ -11,7 +11,7 @@ use crate::PosParams;
 
 /// Data that may have values set for future epochs, up to an epoch at offset as
 /// set via the `Offset` type parameter.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Epoched<Data, Offset>
 where
     Data: Clone + BorshDeserialize + BorshSerialize + BorshSchema,
@@ -24,60 +24,10 @@ where
     offset: PhantomData<Offset>,
 }
 
-impl<Data, Offset> PartialEq for Epoched<Data, Offset>
-where
-    Data: PartialEq + Clone + BorshDeserialize + BorshSerialize + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.last_update == other.last_update
-            && self.data == other.data
-            && self.offset == other.offset
-    }
-}
-
-impl<Data, Offset> Eq for Epoched<Data, Offset>
-where
-    Data: Eq + Clone + BorshDeserialize + BorshSerialize + BorshSchema,
-    Offset: EpochOffset,
-{
-}
-
-impl<Data, Offset> PartialOrd for Epoched<Data, Offset>
-where
-    Data: PartialOrd + Clone + BorshDeserialize + BorshSerialize + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        match self.last_update.partial_cmp(&other.last_update) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        match self.data.partial_cmp(&other.data) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        self.offset.partial_cmp(&other.offset)
-    }
-}
-
-impl<Data, Offset> Ord for Epoched<Data, Offset>
-where
-    Data: Ord + Clone + BorshDeserialize + BorshSerialize + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.last_update
-            .cmp(&other.last_update)
-            .then(self.data.cmp(&other.data))
-            .then(self.offset.cmp(&other.offset))
-    }
-}
-
 /// Data that may have delta values (a difference from the predecessor epoch)
 /// set for future epochs, up to an epoch at offset as set via the `Offset` type
 /// parameter.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EpochedDelta<Data, Offset>
 where
     Data: Clone
@@ -94,76 +44,6 @@ where
     offset: PhantomData<Offset>,
 }
 
-impl<Data, Offset> PartialEq for EpochedDelta<Data, Offset>
-where
-    Data: PartialEq
-        + Clone
-        + ops::Add<Output = Data>
-        + BorshDeserialize
-        + BorshSerialize
-        + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.last_update == other.last_update
-            && self.data == other.data
-            && self.offset == other.offset
-    }
-}
-
-impl<Data, Offset> Eq for EpochedDelta<Data, Offset>
-where
-    Data: Eq
-        + Clone
-        + ops::Add<Output = Data>
-        + BorshDeserialize
-        + BorshSerialize
-        + BorshSchema,
-    Offset: EpochOffset,
-{
-}
-
-impl<Data, Offset> PartialOrd for EpochedDelta<Data, Offset>
-where
-    Data: PartialOrd
-        + Clone
-        + ops::Add<Output = Data>
-        + BorshDeserialize
-        + BorshSerialize
-        + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        match self.last_update.partial_cmp(&other.last_update) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        match self.data.partial_cmp(&other.data) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        self.offset.partial_cmp(&other.offset)
-    }
-}
-
-impl<Data, Offset> Ord for EpochedDelta<Data, Offset>
-where
-    Data: Ord
-        + Clone
-        + ops::Add<Output = Data>
-        + BorshDeserialize
-        + BorshSerialize
-        + BorshSchema,
-    Offset: EpochOffset,
-{
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.last_update
-            .cmp(&other.last_update)
-            .then(self.data.cmp(&other.data))
-            .then(self.offset.cmp(&other.offset))
-    }
-}
-
 /// Which offset should be used to set data. The value is read from
 /// [`PosParams`].
 pub trait EpochOffset:
@@ -176,7 +56,7 @@ pub trait EpochOffset:
 }
 
 /// Offset at pipeline length.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OffsetPipelineLen;
 impl EpochOffset for OffsetPipelineLen {
     fn value(params: &PosParams) -> u64 {
@@ -189,7 +69,7 @@ impl EpochOffset for OffsetPipelineLen {
 }
 
 /// Offset at unbonding length.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize, BorshSchema, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OffsetUnboundingLen;
 impl EpochOffset for OffsetUnboundingLen {
     fn value(params: &PosParams) -> u64 {
@@ -202,7 +82,7 @@ impl EpochOffset for OffsetUnboundingLen {
 }
 
 /// Offset length dynamic choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DynEpochOffset {
     /// Offset at pipeline length.
     PipelineLen,
