@@ -99,6 +99,50 @@
 //! - add arb invalid storage changes
 //! - add slashes
 
+use anoma_vm_env::proof_of_stake::{
+    staking_token_address, GenesisValidator, PosParams,
+};
+
+use crate::tx::tx_host_env;
+
+fn init_pos(genesis_validators: &[GenesisValidator], params: PosParams) {
+    tx_host_env::init();
+
+    tx_host_env::with(|tx_env| {
+        // let staking_reward_address =
+        // address::testing::established_address_1(); let consensus_key
+        // = key::testing::keypair_1().ref_to(); let staking_reward_key
+        // = key::testing::keypair_2().ref_to();
+
+        // Ensure that all the used addresses exist
+        tx_env.spawn_accounts([&staking_token_address()]);
+        // tx_env.spawn_accounts([&bond.validator, &staking_reward_address]);
+
+        // Ensure that the bond's source has enough tokens for the bond
+        let target = bond.source.as_ref().unwrap_or(&bond.validator);
+        tx_env.credit_tokens(target, &staking_token_address(), bond.amount);
+
+        let genesis_validator = &GenesisValidator {
+            address: bond.validator.clone(),
+            staking_reward_address,
+            tokens: initial_stake,
+            consensus_key,
+            staking_reward_key,
+        };
+
+        // Initialize PoS storage
+        let start_epoch = 0;
+        tx_env
+            .storage
+            .init_genesis(
+                &pos_params,
+                [genesis_validator].into_iter(),
+                start_epoch,
+            )
+            .unwrap();
+    });
+}
+
 #[cfg(test)]
 mod tests {
 
