@@ -24,6 +24,7 @@ mod tests {
 
     use anoma::proto::Tx;
     use anoma_tests::log::test;
+    use anoma_tests::native_vp::TestNativeVpEnv;
     use anoma_tests::tx::*;
     use anoma_tx_prelude::address::testing::{
         arb_established_address, arb_non_internal_address,
@@ -34,19 +35,26 @@ mod tests {
     use anoma_tx_prelude::proof_of_stake::parameters::testing::arb_pos_params;
     use anoma_tx_prelude::token;
     use anoma_vp_prelude::proof_of_stake::anoma_proof_of_stake::PosBase;
-    use anoma_vp_prelude::proof_of_stake::types::Bond;
+    use anoma_vp_prelude::proof_of_stake::types::{
+        Bond, VotingPower, VotingPowerDelta,
+    };
     use anoma_vp_prelude::proof_of_stake::{
-        staking_token_address, BondId, GenesisValidator,
+        staking_token_address, BondId, GenesisValidator, PosVP,
     };
     use proptest::prelude::*;
 
     use super::*;
 
     proptest! {
-        /// An example test, checking that this transaction performs no storage
-        /// modifications.
+        /// In this test we setup the ledger and PoS system with an arbitrary
+        /// initial state with 1 genesis validator, arbitrary PoS parameters and
+        /// a we generate an arbitrary bond that we'd like to apply.
+        ///
+        /// After we apply the bond, we're checking that all the storage values
+        /// in PoS system have been updated as expected and then we also check
+        /// that this transaction is accepted by the PoS validity predicate.
         #[test]
-        fn test_no_op_transaction(
+        fn test_tx_bond(
             (initial_stake, bond) in arb_initial_stake_and_bond(),
             key in arb_common_keypair(),
             pos_params in arb_pos_params()) {
@@ -78,12 +86,12 @@ mod tests {
                 };
 
                 // Initialize PoS storage
+                let start_epoch = 0;
                 tx_env.storage
                     .init_genesis(
                         &pos_params,
                         [genesis_validator].into_iter(),
-                        // TODO different starting epoch?
-                        0,
+                        start_epoch,
                     )
                     .unwrap();
             });
@@ -98,7 +106,9 @@ mod tests {
             let pos_balance_key = token::balance_key(&staking_token_address(), &Address::Internal(InternalAddress::PoS));
             let pos_balance_pre: token::Amount = read(&pos_balance_key.to_string()).expect("PoS must have balance");
             assert_eq!(pos_balance_pre, initial_stake);
-            // let bonds_pre = PoS.read_bond(&bond.validator);
+            let total_voting_powers_pre = PoS.read_total_voting_power();
+            let validator_sets_pre = PoS.read_validator_set();
+            let validator_voting_powers_pre = PoS.read_validator_voting_power(&bond.validator).unwrap();
 
             apply_tx(tx_data);
 
@@ -155,12 +165,64 @@ mod tests {
                 }
             }
 
-            // TODO:
-
+            // If the voting power from validator's initial stake is different
+            // from the voting power after the bond is applied, we expect the
+            // following 3 fields to be updated:
             //     - `#{PoS}/total_voting_power` (optional)
             //     - `#{PoS}/validator_set` (optional)
             //     - `#{PoS}/validator/#{validator}/voting_power` (optional)
+            let total_voting_powers_post = PoS.read_total_voting_power();
+            let validator_sets_post = PoS.read_validator_set();
+            let validator_voting_powers_post = PoS.read_validator_voting_power(&bond.validator).unwrap();
 
+            let voting_power_pre = VotingPower::from_tokens(initial_stake, &pos_params);
+            let voting_power_post = VotingPower::from_tokens(initial_stake + bond.amount, &pos_params);
+            if voting_power_pre == voting_power_post {
+                // None of the optional storage fields should have been updated
+                assert_eq!(total_voting_powers_pre, total_voting_powers_post);
+                assert_eq!(validator_sets_pre, validator_sets_post);
+                assert_eq!(validator_voting_powers_pre, validator_voting_powers_post);
+            } else {
+                for epoch in 0..pos_params.pipeline_len {
+                    let total_voting_power_pre = total_voting_powers_pre.get(epoch);
+                    let total_voting_power_post = total_voting_powers_post.get(epoch);
+                    assert_eq!(total_voting_power_pre, total_voting_power_post, "Total voting power before pipeline offset must not change - checking epoch {epoch}");
+
+                    let validator_set_pre = validator_sets_pre.get(epoch);
+                    let validator_set_post = validator_sets_post.get(epoch);
+                    assert_eq!(validator_set_pre, validator_set_post, "Validator set before pipeline offset must not change - checking epoch {epoch}");
+
+                    let validator_voting_power_pre = validator_voting_powers_pre.get(epoch);
+                    let validator_voting_power_post = validator_voting_powers_post.get(epoch);
+                    assert_eq!(validator_voting_power_pre, validator_voting_power_post, "Validator's voting power before pipeline offset must not change - checking epoch {epoch}");
+                }
+                for epoch in pos_params.pipeline_len..=pos_params.unbonding_len {
+                    let total_voting_power_pre = total_voting_powers_pre.get(epoch).unwrap();
+                    let total_voting_power_post = total_voting_powers_post.get(epoch).unwrap();
+                    assert_ne!(total_voting_power_pre, total_voting_power_post, "Total voting power at and after pipeline offset must have changed - checking epoch {epoch}");
+
+                    let validator_set_pre = validator_sets_pre.get(epoch).unwrap();
+                    let validator_set_post = validator_sets_post.get(epoch).unwrap();
+                    assert_ne!(validator_set_pre, validator_set_post, "Validator set at and after pipeline offset must have changed - checking epoch {epoch}");
+
+                    let validator_voting_power_pre = validator_voting_powers_pre.get(epoch).unwrap();
+                    let validator_voting_power_post = validator_voting_powers_post.get(epoch).unwrap();
+                    assert_ne!(validator_voting_power_pre, validator_voting_power_post, "Validator's voting power at and after pipeline offset must have changed - checking epoch {epoch}");
+
+                    // Expected voting power from the model ...
+                    let expected_validator_voting_power: VotingPowerDelta = voting_power_post.try_into().unwrap();
+                    // ... must match the voting power read from storage
+                    assert_eq!(validator_voting_power_post, expected_validator_voting_power);
+                }
+            }
+
+            // Use the tx_env to run PoS VP
+            let tx_env = tx_host_env::take();
+            let vp_env = TestNativeVpEnv::new(tx_env);
+            let result = vp_env.validate_tx(PosVP::new, |_tx_data| {});
+            let result =
+                result.expect("Validation of valid changes must not fail!");
+            assert!(result, "PoS Validity predicate must accept this transaction");
         }
     }
 
@@ -186,7 +248,7 @@ mod tests {
         (
             arb_established_address(),
             prop::option::of(arb_non_internal_address()),
-            token::testing::arb_amount_ceiled(max_amount.into()),
+            token::testing::arb_amount_ceiled(max_amount),
         )
             .prop_map(|(validator, source, amount)| {
                 transaction::pos::Bond {
