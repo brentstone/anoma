@@ -12,15 +12,24 @@ use core::fmt::Debug;
 use tendermint::block::Header;
 #[cfg(not(feature = "ABCI"))]
 use tendermint::merkle::proof::Proof;
+#[cfg(not(feature = "ABCI"))]
+use tendermint_proto::Error as TmProtoError;
+#[cfg(not(feature = "ABCI"))]
+use tendermint_proto::Protobuf;
+#[cfg(feature = "ABCI")]
+use tendermint_proto_abci::Error as TmProtoError;
+#[cfg(feature = "ABCI")]
+use tendermint_proto_abci::Protobuf;
 #[cfg(feature = "ABCI")]
 use tendermint_stable::block::Header;
 #[cfg(feature = "ABCI")]
 use tendermint_stable::merkle::proof::Proof;
 use thiserror::Error;
 
+use super::parameters;
 use super::parameters::Parameters;
 use crate::ledger::gas::MIN_STORAGE_GAS;
-use crate::ledger::parameters::{self, EpochDuration};
+use crate::ledger::parameters::EpochDuration;
 use crate::ledger::storage::merkle_tree::{
     Error as MerkleTreeError, MerkleRoot,
 };
@@ -98,8 +107,12 @@ pub enum Error {
     CodingError(types::Error),
     #[error("Merkle tree error: {0}")]
     MerkleTreeError(MerkleTreeError),
-    #[error("Merkle tree error: {0}")]
+    #[error("DB error: {0}")]
     DBError(String),
+    #[error("Tendermint Protobuf error: {0}")]
+    ProtobufCodingError(TmProtoError),
+    #[error("Merkle tree at the height {height} is not stored")]
+    NoMerkleTree { height: BlockHeight },
 }
 
 /// The block's state as stored in the database.
@@ -129,6 +142,8 @@ pub struct BlockStateRead {
 pub struct BlockStateWrite<'a> {
     /// Merkle tree stores
     pub merkle_tree_stores: MerkleTreeStoresWrite<'a>,
+    /// Header of the block
+    pub header: Option<&'a Header>,
     /// Hash of the block
     pub hash: &'a BlockHash,
     /// Height of the block
@@ -170,8 +185,24 @@ pub trait DB: std::fmt::Debug {
     /// Write block's metadata
     fn write_block(&mut self, state: BlockStateWrite) -> Result<()>;
 
+    /// Read the block header with the given height from the DB
+    fn read_block_header(&self, height: BlockHeight) -> Result<Option<Header>>;
+
+    /// Read the merkle tree stores with the given height
+    fn read_merkle_tree_stores(
+        &self,
+        height: BlockHeight,
+    ) -> Result<Option<MerkleTreeStoresRead>>;
+
     /// Read the latest value for account subspace key from the DB
     fn read_subspace_val(&self, key: &Key) -> Result<Option<Vec<u8>>>;
+
+    /// Read the value for account subspace key at the given height from the DB
+    fn read_subspace_val_with_height(
+        &self,
+        key: &Key,
+        _height: BlockHeight,
+    ) -> Result<Option<Vec<u8>>>;
 
     /// Write the value with the given height and account subspace key to the
     /// DB. Returns the size difference from previous value, if any, or the
@@ -328,6 +359,7 @@ where
     pub fn commit(&mut self) -> Result<()> {
         let state = BlockStateWrite {
             merkle_tree_stores: self.block.tree.stores(),
+            header: self.header.as_ref(),
             hash: &self.block.hash,
             height: self.block.height,
             epoch: self.block.epoch,
@@ -369,6 +401,26 @@ where
                 Ok((Some(v), gas as _))
             }
             None => Ok((None, key.len() as _)),
+        }
+    }
+
+    /// Returns a value from the specified subspace at the given height and the
+    /// gas cost
+    pub fn read_with_height(
+        &self,
+        key: &Key,
+        height: BlockHeight,
+    ) -> Result<(Option<Vec<u8>>, u64)> {
+        if height >= self.get_block_height().0 {
+            self.read(key)
+        } else {
+            match self.db.read_subspace_val_with_height(key, height)? {
+                Some(v) => {
+                    let gas = key.len() + v.len();
+                    Ok((Some(v), gas as _))
+                }
+                None => Ok((None, key.len() as _)),
+            }
         }
     }
 
@@ -467,13 +519,34 @@ where
         &self,
         key: &Key,
         value: Vec<u8>,
+        height: BlockHeight,
     ) -> Result<Proof> {
-        Ok(self.block.tree.get_existence_proof(key, value)?)
+        if height >= self.get_block_height().0 {
+            Ok(self.block.tree.get_existence_proof(key, value)?)
+        } else {
+            match self.db.read_merkle_tree_stores(height)? {
+                Some(stores) => Ok(MerkleTree::<H>::new(stores)
+                    .get_existence_proof(key, value)?),
+                None => Err(Error::NoMerkleTree { height }),
+            }
+        }
     }
 
     /// Get the non-existence proof
-    pub fn get_non_existence_proof(&self, key: &Key) -> Result<Proof> {
-        Ok(self.block.tree.get_non_existence_proof(key)?)
+    pub fn get_non_existence_proof(
+        &self,
+        key: &Key,
+        height: BlockHeight,
+    ) -> Result<Proof> {
+        if height >= self.get_block_height().0 {
+            Ok(self.block.tree.get_non_existence_proof(key)?)
+        } else {
+            match self.db.read_merkle_tree_stores(height)? {
+                Some(stores) => Ok(MerkleTree::<H>::new(stores)
+                    .get_non_existence_proof(key)?),
+                None => Err(Error::NoMerkleTree { height }),
+            }
+        }
     }
 
     /// Get the current (yet to be committed) block epoch
@@ -503,8 +576,23 @@ where
     }
 
     /// Get the block header
-    pub fn get_block_header(&self) -> (Option<Header>, u64) {
-        (self.header.clone(), MIN_STORAGE_GAS)
+    pub fn get_block_header(
+        &self,
+        height: Option<BlockHeight>,
+    ) -> Result<(Option<Header>, u64)> {
+        match height {
+            Some(h) if h == self.get_block_height().0 => {
+                Ok((self.header.clone(), MIN_STORAGE_GAS))
+            }
+            Some(h) => match self.db.read_block_header(h)? {
+                Some(header) => {
+                    let gas = header.encoded_len() as u64;
+                    Ok((Some(header), gas))
+                }
+                None => Ok((None, MIN_STORAGE_GAS)),
+            },
+            None => Ok((self.header.clone(), MIN_STORAGE_GAS)),
+        }
     }
 
     /// Initialize a new epoch when the current epoch is finished. Returns
@@ -664,7 +752,7 @@ mod tests {
 
     use super::testing::*;
     use super::*;
-    use crate::ledger::parameters::Parameters;
+    use crate::ledger::parameters::{self, Parameters};
     use crate::types::time::{self, Duration};
 
     prop_compose! {
@@ -733,7 +821,7 @@ mod tests {
                 vp_whitelist: vec![],
                 tx_whitelist: vec![]
             };
-            parameters::init_genesis_storage(&mut storage, &parameters);
+            parameters.init_storage(&mut storage);
 
             let epoch_before = storage.last_epoch;
             assert_eq!(epoch_before, storage.block.epoch);

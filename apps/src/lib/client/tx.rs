@@ -2,12 +2,20 @@ use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fs::File;
 
+use anoma::ledger::governance::storage as gov_storage;
 use anoma::ledger::pos::{BondId, Bonds, Unbonds};
 use anoma::proto::Tx;
-use anoma::types::address::Address;
+use anoma::types::address::{xan as m1t, Address};
+use anoma::types::governance::{
+    OfflineProposal, OfflineVote, Proposal, ProposalVote,
+};
 use anoma::types::key::*;
 use anoma::types::nft::{self, Nft, NftToken};
 use anoma::types::storage::Epoch;
+use anoma::types::token::Amount;
+use anoma::types::transaction::governance::{
+    InitProposalData, VoteProposalData,
+};
 use anoma::types::transaction::nft::{CreateNft, MintNft};
 use anoma::types::transaction::{
     hash_tx, pos, Fee, InitAccount, InitValidator, UpdateVp, WrapperTx,
@@ -48,6 +56,8 @@ use crate::node::ledger::tendermint_node;
 
 const TX_INIT_ACCOUNT_WASM: &str = "tx_init_account.wasm";
 const TX_INIT_VALIDATOR_WASM: &str = "tx_init_validator.wasm";
+const TX_INIT_PROPOSAL: &str = "tx_init_proposal.wasm";
+const TX_VOTE_PROPOSAL: &str = "tx_vote_proposal.wasm";
 const TX_UPDATE_VP_WASM: &str = "tx_update_vp.wasm";
 const TX_TRANSFER_WASM: &str = "tx_transfer.wasm";
 const TX_INIT_NFT: &str = "tx_init_nft.wasm";
@@ -407,7 +417,8 @@ pub async fn submit_transfer(ctx: Context, args: args::TxTransfer) {
     // Check source balance
     let balance_key = token::balance_key(&token, &source);
     let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
-    match rpc::query_storage_value::<token::Amount>(client, balance_key).await {
+    match rpc::query_storage_value::<token::Amount>(&client, &balance_key).await
+    {
         Some(balance) => {
             if balance < args.amount {
                 eprintln!(
@@ -487,18 +498,16 @@ pub async fn submit_mint_nft(ctx: Context, args: args::NftMint) {
 
     let nft_creator_key = nft::get_creator_key(&args.nft_address);
     let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
-    let nft_creator_address = match rpc::query_storage_value::<Address>(
-        client,
-        nft_creator_key,
-    )
-    .await
-    {
-        Some(addr) => addr,
-        None => {
-            eprintln!("No creator key found for {}", &args.nft_address);
-            safe_exit(1);
-        }
-    };
+    let nft_creator_address =
+        match rpc::query_storage_value::<Address>(&client, &nft_creator_key)
+            .await
+        {
+            Some(addr) => addr,
+            None => {
+                eprintln!("No creator key found for {}", &args.nft_address);
+                safe_exit(1);
+            }
+        };
 
     let signer = Some(WalletAddress::new(nft_creator_address.to_string()));
 
@@ -516,6 +525,272 @@ pub async fn submit_mint_nft(ctx: Context, args: args::NftMint) {
 
     let tx = Tx::new(tx_code, Some(data));
     process_tx(ctx, &args.tx, tx, signer.as_ref()).await;
+}
+
+pub async fn submit_init_proposal(mut ctx: Context, args: args::InitProposal) {
+    let file = File::open(&args.proposal_data).expect("File must exist.");
+    let proposal: Proposal =
+        serde_json::from_reader(file).expect("JSON was not well-formatted");
+
+    let signer = WalletAddress::new(proposal.clone().author.to_string());
+
+    if args.offline {
+        let signer = ctx.get(&signer);
+        let signing_key = signing::find_keypair(
+            &mut ctx.wallet,
+            &signer,
+            args.tx.ledger_address.clone(),
+        )
+        .await;
+        let offline_proposal =
+            OfflineProposal::new(proposal, signer, &signing_key);
+        let proposal_filename = "proposal".to_string();
+        let out = File::create(&proposal_filename).unwrap();
+        match serde_json::to_writer_pretty(out, &offline_proposal) {
+            Ok(_) => {
+                println!("Proposal created: {}.", proposal_filename);
+            }
+            Err(e) => {
+                eprintln!("Error while creating proposal file: {}.", e);
+                safe_exit(1)
+            }
+        }
+    } else {
+        let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
+
+        let tx_data: Result<InitProposalData, _> = proposal.clone().try_into();
+        let init_proposal_data = if let Ok(data) = tx_data {
+            data
+        } else {
+            eprintln!("Invalid data for init proposal transaction.");
+            safe_exit(1)
+        };
+
+        let min_proposal_funds_key = gov_storage::get_min_proposal_fund_key();
+        let min_proposal_funds: Amount =
+            rpc::query_storage_value(&client, &min_proposal_funds_key)
+                .await
+                .unwrap();
+        let balance = rpc::get_token_balance(&client, &m1t(), &proposal.author)
+            .await
+            .unwrap_or_default();
+        if balance < min_proposal_funds {
+            eprintln!(
+                "Address {} doesn't have enough funds.",
+                &proposal.author
+            );
+            safe_exit(1);
+        }
+        let min_proposal_funds_key = gov_storage::get_min_proposal_fund_key();
+        let min_proposal_funds: Amount =
+            rpc::query_storage_value(&client, &min_proposal_funds_key)
+                .await
+                .unwrap();
+
+        let balance = rpc::get_token_balance(&client, &m1t(), &proposal.author)
+            .await
+            .unwrap_or_default();
+        if balance < min_proposal_funds {
+            eprintln!(
+                "Address {} doesn't have enough funds.",
+                &proposal.author
+            );
+            safe_exit(1);
+        }
+
+        let data = init_proposal_data
+            .try_to_vec()
+            .expect("Encoding proposal data shouldn't fail");
+        let tx_code = ctx.read_wasm(TX_INIT_PROPOSAL);
+        let tx = Tx::new(tx_code, Some(data));
+
+        process_tx(ctx, &args.tx, tx, Some(&signer)).await;
+    }
+}
+
+pub async fn submit_vote_proposal(mut ctx: Context, args: args::VoteProposal) {
+    let signer = if let Some(addr) = &args.tx.signer {
+        addr
+    } else {
+        eprintln!("Missing mandatory argument --signer.");
+        safe_exit(1)
+    };
+
+    if args.offline {
+        let signer = ctx.get(signer);
+        let proposal_file_path =
+            args.proposal_data.expect("Proposal file should exist.");
+        let file = File::open(&proposal_file_path).expect("File must exist.");
+
+        let proposal: OfflineProposal =
+            serde_json::from_reader(file).expect("JSON was not well-formatted");
+        let public_key = rpc::get_public_key(
+            &proposal.address,
+            args.tx.ledger_address.clone(),
+        )
+        .await
+        .expect("Public key should exist.");
+        if !proposal.check_signature(&public_key) {
+            eprintln!("Proposal signature mismatch!");
+            safe_exit(1)
+        }
+
+        let signing_key = signing::find_keypair(
+            &mut ctx.wallet,
+            &signer,
+            args.tx.ledger_address.clone(),
+        )
+        .await;
+        let offline_vote = OfflineVote::new(
+            &proposal,
+            args.vote,
+            signer.clone(),
+            &signing_key,
+        );
+
+        let proposal_vote_filename =
+            format!("proposal-vote-{}", &signer.to_string());
+        let out = File::create(&proposal_vote_filename).unwrap();
+        match serde_json::to_writer_pretty(out, &offline_vote) {
+            Ok(_) => {
+                println!("Proposal vote created: {}.", proposal_vote_filename);
+            }
+            Err(e) => {
+                eprintln!("Error while creating proposal vote file: {}.", e);
+                safe_exit(1)
+            }
+        }
+    } else {
+        let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
+
+        let voter_address = ctx.get(signer);
+        let proposal_id = args.proposal_id.unwrap();
+        let proposal_start_epoch_key =
+            gov_storage::get_voting_start_epoch_key(proposal_id);
+        let proposal_start_epoch = rpc::query_storage_value::<Epoch>(
+            &client,
+            &proposal_start_epoch_key,
+        )
+        .await;
+
+        match proposal_start_epoch {
+            Some(epoch) => {
+                let mut delegation_addresses = rpc::get_delegators_delegation(
+                    &client,
+                    &voter_address,
+                    epoch,
+                )
+                .await;
+
+                // Optimize by quering if a vote from a validator
+                // is equal to ours. If so, we can avoid voting, but ONLY if we
+                // are  voting in the last third of the voting
+                // window, otherwise there's  the risk of the
+                // validator changing his vote and, effectively, invalidating
+                // the delgator's vote
+                if !args.tx.force
+                    && is_safe_voting_window(
+                        args.tx.ledger_address.clone(),
+                        &client,
+                        proposal_id,
+                        epoch,
+                    )
+                    .await
+                {
+                    delegation_addresses = filter_delegations(
+                        &client,
+                        delegation_addresses,
+                        proposal_id,
+                        &args.vote,
+                    )
+                    .await;
+                }
+
+                let tx_data = VoteProposalData {
+                    id: proposal_id,
+                    vote: args.vote,
+                    voter: voter_address,
+                    delegations: delegation_addresses,
+                };
+
+                let data = tx_data
+                    .try_to_vec()
+                    .expect("Encoding proposal data shouldn't fail");
+                let tx_code = ctx.read_wasm(TX_VOTE_PROPOSAL);
+                let tx = Tx::new(tx_code, Some(data));
+
+                process_tx(ctx, &args.tx, tx, Some(signer)).await;
+            }
+            None => {
+                eprintln!("Proposal start epoch is not in the storage.")
+            }
+        }
+    }
+}
+
+/// Check if current epoch is in the last third of the voting period of the
+/// proposal. This ensures that it is safe to optimize the vote writing to
+/// storage.
+async fn is_safe_voting_window(
+    ledger_address: TendermintAddress,
+    client: &HttpClient,
+    proposal_id: u64,
+    proposal_start_epoch: Epoch,
+) -> bool {
+    let current_epoch = rpc::query_epoch(args::Query { ledger_address }).await;
+
+    let proposal_end_epoch_key =
+        gov_storage::get_voting_end_epoch_key(proposal_id);
+    let proposal_end_epoch =
+        rpc::query_storage_value::<Epoch>(client, &proposal_end_epoch_key)
+            .await;
+
+    match proposal_end_epoch {
+        Some(proposal_end_epoch) => {
+            !anoma::ledger::governance::vp::is_valid_validator_voting_period(
+                current_epoch,
+                proposal_start_epoch,
+                proposal_end_epoch,
+            )
+        }
+        None => {
+            eprintln!("Proposal end epoch is not in the storage.");
+            safe_exit(1)
+        }
+    }
+}
+
+/// Removes validators whose vote corresponds to that of the delegator (needless
+/// vote)
+async fn filter_delegations(
+    client: &HttpClient,
+    mut delegation_addresses: Vec<Address>,
+    proposal_id: u64,
+    delegator_vote: &ProposalVote,
+) -> Vec<Address> {
+    let mut remove_indexes: Vec<usize> = vec![];
+
+    for (index, validator_address) in delegation_addresses.iter().enumerate() {
+        let vote_key = gov_storage::get_vote_proposal_key(
+            proposal_id,
+            validator_address.to_owned(),
+            validator_address.to_owned(),
+        );
+
+        if let Some(validator_vote) =
+            rpc::query_storage_value::<ProposalVote>(client, &vote_key).await
+        {
+            if &validator_vote == delegator_vote {
+                remove_indexes.push(index);
+            }
+        }
+    }
+
+    for index in remove_indexes {
+        delegation_addresses.swap_remove(index);
+    }
+
+    delegation_addresses
 }
 
 pub async fn submit_bond(ctx: Context, args: args::Bond) {
@@ -549,7 +824,8 @@ pub async fn submit_bond(ctx: Context, args: args::Bond) {
     let bond_source = source.as_ref().unwrap_or(&validator);
     let balance_key = token::balance_key(&address::xan(), bond_source);
     let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
-    match rpc::query_storage_value::<token::Amount>(client, balance_key).await {
+    match rpc::query_storage_value::<token::Amount>(&client, &balance_key).await
+    {
         Some(balance) => {
             if balance < args.amount {
                 eprintln!(
@@ -609,8 +885,7 @@ pub async fn submit_unbond(ctx: Context, args: args::Unbond) {
     };
     let bond_key = ledger::pos::bond_key(&bond_id);
     let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
-    let bonds =
-        rpc::query_storage_value::<Bonds>(client.clone(), bond_key).await;
+    let bonds = rpc::query_storage_value::<Bonds>(&client, &bond_key).await;
     match bonds {
         Some(bonds) => {
             let mut bond_amount: token::Amount = 0.into();
@@ -682,8 +957,7 @@ pub async fn submit_withdraw(ctx: Context, args: args::Withdraw) {
     };
     let bond_key = ledger::pos::unbond_key(&bond_id);
     let client = HttpClient::new(args.tx.ledger_address.clone()).unwrap();
-    let unbonds =
-        rpc::query_storage_value::<Unbonds>(client.clone(), bond_key).await;
+    let unbonds = rpc::query_storage_value::<Unbonds>(&client, &bond_key).await;
     match unbonds {
         Some(unbonds) => {
             let mut unbonded_amount: token::Amount = 0.into();

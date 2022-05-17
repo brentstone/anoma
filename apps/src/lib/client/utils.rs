@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,6 +13,7 @@ use borsh::BorshSerialize;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use prost::bytes::Bytes;
 use rand::prelude::ThreadRng;
 use rand::thread_rng;
 use serde_json::json;
@@ -80,7 +81,6 @@ pub async fn join_network(
         }
     }
     let base_dir_full = fs::canonicalize(&base_dir).await.unwrap();
-    let cwd = env::current_dir().unwrap();
     let chain_dir = base_dir_full.join(chain_id.as_str());
 
     let validator_alias_and_dir = pre_genesis_path
@@ -150,16 +150,21 @@ pub async fn join_network(
 
     // Read or download the release archive
     println!("Downloading config release from {} ...", release_url);
-    let release = download_file(release_url).await;
+    let release = match download_file(release_url).await {
+        Ok(contents) => contents,
+        Err(error) => {
+            eprintln!("Error downloading release: {}", error);
+            cli::safe_exit(1);
+        }
+    };
 
     // Decode and unpack the archive
-    let mut decoder = GzDecoder::new(&release[..]);
-    let mut tar = String::new();
-    decoder.read_to_string(&mut tar).unwrap();
-    let mut archive = tar::Archive::new(tar.as_bytes());
+    let decoder = GzDecoder::new(&release[..]);
+    let mut archive = tar::Archive::new(decoder);
 
     // If the base-dir is non-default, unpack the archive into a temp dir inside
     // first.
+    let cwd = env::current_dir().unwrap();
     let (unpack_dir, non_default_dir) =
         if base_dir_full != cwd.join(config::DEFAULT_BASE_DIR) {
             (base_dir.clone(), true)
@@ -1108,24 +1113,12 @@ pub fn init_genesis_validator(
     );
 }
 
-async fn download_file(url: impl AsRef<str>) -> Vec<u8> {
+async fn download_file(url: impl AsRef<str>) -> reqwest::Result<Bytes> {
     let url = url.as_ref();
-    reqwest::get(url)
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!("File not found at {}. Error: {}", url, err);
-            cli::safe_exit(1)
-        })
-        .bytes()
-        .await
-        .unwrap_or_else(|err| {
-            eprintln!(
-                "Failed to download file from {} with error: {}",
-                url, err
-            );
-            cli::safe_exit(1)
-        })
-        .to_vec()
+    let response = reqwest::get(url).await?;
+    response.error_for_status_ref()?;
+    let contents = response.bytes().await?;
+    Ok(contents)
 }
 
 fn try_parse_public_key(

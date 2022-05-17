@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use prost::Message;
 use sha2::Digest;
 use thiserror::Error;
 
@@ -361,6 +362,10 @@ pub trait IbcActions {
         let mut connection =
             ConnectionEnd::decode_vec(&value).map_err(Error::Decoding)?;
         open_connection(&mut connection);
+        let mut counterparty = connection.counterparty().clone();
+        counterparty.connection_id =
+            Some(msg.counterparty_connection_id.clone());
+        connection.set_counterparty(counterparty);
         self.write_ibc_data(
             &conn_key,
             connection.encode_vec().expect("encoding shouldn't fail"),
@@ -452,6 +457,8 @@ pub trait IbcActions {
         })?;
         let mut channel =
             ChannelEnd::decode_vec(&value).map_err(Error::Decoding)?;
+        channel
+            .set_counterparty_channel_id(msg.counterparty_channel_id.clone());
         open_channel(&mut channel);
         self.write_ibc_data(
             &channel_key,
@@ -584,7 +591,11 @@ pub trait IbcActions {
             packet.sequence,
         );
         let commitment = commitment(&packet);
-        self.write_ibc_data(&commitment_key, commitment.as_bytes());
+        let mut commitment_bytes = vec![];
+        commitment
+            .encode(&mut commitment_bytes)
+            .expect("encoding shouldn't fail");
+        self.write_ibc_data(&commitment_key, commitment_bytes);
 
         let event = make_send_packet_event(packet).try_into().unwrap();
         self.emit_ibc_event(event);
@@ -769,20 +780,21 @@ pub trait IbcActions {
 
     /// Get and increment the sequence
     fn get_and_inc_sequence(&self, key: &Key) -> Result<Sequence> {
-        if let Some(v) = self.read_ibc_data(key) {
-            let index: [u8; 8] = v.try_into().map_err(|_| {
-                Error::Sequence(format!(
-                    "The sequence index wasn't u64: Key {}",
-                    key
-                ))
-            })?;
-            let index: u64 = u64::from_be_bytes(index);
-            self.write_ibc_data(key, (index + 1).to_be_bytes());
-            Ok(index.into())
-        } else {
+        let index = match self.read_ibc_data(key) {
+            Some(v) => {
+                let index: [u8; 8] = v.try_into().map_err(|_| {
+                    Error::Sequence(format!(
+                        "The sequence index wasn't u64: Key {}",
+                        key
+                    ))
+                })?;
+                u64::from_be_bytes(index)
+            }
             // when the sequence has never been used, returns the initial value
-            Ok(1.into())
-        }
+            None => 1,
+        };
+        self.write_ibc_data(key, (index + 1).to_be_bytes());
+        Ok(index.into())
     }
 
     /// Bind a new port
