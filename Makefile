@@ -30,10 +30,10 @@ build-test-abci-plus-plus:
 	$(cargo) build --tests --no-default-features --features "ABCI-plus-plus"
 
 build-release:
-	ANOMA_DEV=false $(cargo) build --release --package anoma_apps
+	$(cargo) build --release --package anoma_apps
 
 check-release:
-	ANOMA_DEV=false $(cargo) check --release --package anoma_apps
+	$(cargo) check --release --package anoma_apps
 
 package: build-release
 	scripts/make-package.sh
@@ -61,12 +61,12 @@ clippy-wasm = $(cargo) +$(nightly) clippy --manifest-path $(wasm)/Cargo.toml --a
 clippy-wasm-abci-plus-plus = $(cargo) +$(nightly) clippy --manifest-path $(wasm)/Cargo.toml --all-targets --no-default-features --features "ABCI-plus-plus" -- -D warnings
 
 clippy:
-	ANOMA_DEV=false $(cargo) +$(nightly) clippy --all-targets -- -D warnings && \
+	$(cargo) +$(nightly) clippy --all-targets -- -D warnings && \
 	make -C $(wasms) clippy && \
 	$(foreach wasm,$(wasm_templates),$(clippy-wasm) && ) true
 
 clippy-abci-plus-plus:
-	ANOMA_DEV=false $(cargo) +$(nightly) clippy --all-targets \
+	$(cargo) +$(nightly) clippy --all-targets \
 		--manifest-path ./apps/Cargo.toml \
 		--no-default-features \
 		--features "std testing ABCI-plus-plus" && \
@@ -96,7 +96,7 @@ install: tendermint
 	find "target/release/" -type f \
 		\( -name "$(mm).dll" -o -name "$(mm).dylib" -o -name "$(mm).so" \) \
 		-exec install -d {} ${HOME}/.cargo/lib/ \; && \
-	ANOMA_DEV=false $(cargo) install --path ./apps
+	$(cargo) install --path ./apps
 
 tendermint:
 	./scripts/install/get_tendermint.sh
