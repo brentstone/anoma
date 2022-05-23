@@ -79,7 +79,26 @@ where
             tracing::warn!("data is empty");
             return Ok(false);
         }
+        // signed.data is of type UpdateQueue
+        // verify new TransferFromEthereum's make sense
+        {
+            // for all TransferFromEthereum in signed.data.enqueue
+            // -- validate them
+            // --- seen_block should equal latest_descendant
+            // --- assert /eth_block/${seen_block.hash}/seen = true (as of which
+            // block? this or last?) --- assert the
+            // TransferFromEthereum is in /eth_block/${seen_block.hash}/messages
+            // -- double check they have been appended to /queue exactly once
+        }
+        { // verify existing TransferFromEthereum's in /queue make sense
+            // -- should be same as in previous block, but `latest_descendant`
+            // may have incremented -- if it's disappeared, the
+            // previous block should have reached the minimum confirmations
+            // -- TODO: if it's disappeared, double check wrapped ETH assets
+            // were minted
+        }
 
+        // signature verification
         let epoch = match self.ctx.get_block_epoch() {
             Ok(epoch) => epoch,
             Err(error) => {
